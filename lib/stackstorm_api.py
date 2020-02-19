@@ -1,12 +1,12 @@
 # coding:utf-8
 import json
 import time
+import asyncio
 import urllib3
 import logging
 import requests
-import sseclient
 import traceback
-
+from lib.aiosseclient import aiosseclient
 from requests.exceptions import HTTPError
 
 LOG = logging.getLogger("errbot.plugin.st2.st2_api")
@@ -149,13 +149,24 @@ class StackStormAPI(object):
         """
         Listen for events passing through the stackstorm bus
         """
-        LOG.info("*** Start stream listener ***")
+        LOG.info("*** Start stream listener thread ***")
 
-        def listener(callback=None, bot_identity=None):
+        async def main(loop, callback, bot_identity):
+            LOG.info("*** Start asynchronous tasks ***")
+            tasks = {
+                "listener": {"fn": listener, "hndl": None},
+                "count_down": {"fn": exit_handler, "hndl": None},
+            }
+            for name, task in tasks.items():
+                LOG.info("Waiting for task {}".format(name))
+                task["hndl"] = loop.create_task(task["fn"](loop))
+                await task["hndl"]
 
+        async def listener(loop):
+            LOG.info("*** Start asynchronous listener loop ***")
             token = self.accessctl.get_token_by_userid(bot_identity)
             if not token:
-                self.refresh_bot_credentials()
+                await self.refresh_bot_credentials()
                 token = self.accessctl.get_token_by_userid(bot_identity)
                 if not token:
                     LOG.debug(
@@ -166,13 +177,11 @@ class StackStormAPI(object):
 
             stream_kwargs = {
                 "headers": token.requests(),
-                "verify": self.cfg.verify_cert
+                "verify_ssl": self.cfg.verify_cert
             }
-
             stream_url = "".join([self.cfg.stream_url, "/stream"])
 
-            stream = sseclient.SSEClient(stream_url, **stream_kwargs)
-            for event in stream:
+            async for event in aiosseclient(stream_url, **stream_kwargs):
                 if event.event == "st2.announcement__{}".format(self.cfg.route_key):
                     LOG.debug(
                         "*** Errbot announcement event detected! ***\n{}\n{}\n".format(
@@ -189,20 +198,29 @@ class StackStormAPI(object):
                         p.get('channel'),
                         p.get('extra')
                     )
-                # Test for shutdown after event to avoid losing messages.
-                if self.accessctl.bot.run_listener is False:
-                    break
+
+        async def exit_handler(loop):
+            LOG.info("** Start asynchronous exit handler ***")
+            while self.accessctl.bot.run_listener:
+                await asyncio.sleep(1)
+            LOG.info("*** Stopping listener async loop ***")
+            loop.stop()
 
         StackStormAPI.stream_backoff = 10
-        while self.accessctl.bot.run_listener:
-            try:
-                self.refresh_bot_credentials()
-                listener(callback, bot_identity)
-            except Exception as err:
-                LOG.critical(
-                    "St2 stream listener - An error occurred: {} {}.  "
-                    "Backing off {} seconds.".format(type(err), err, StackStormAPI.stream_backoff)
-                )
-                traceback.print_exc()
-                time.sleep(StackStormAPI.stream_backoff)
-        LOG.info("*** Exit stream listener ***")
+        try:
+            self.refresh_bot_credentials()
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(main(loop, callback, bot_identity))
+        except Exception as err:
+            LOG.critical(
+                "St2 stream listener - An error occurred: {} {}.  "
+                "Backing off {} seconds.".format(type(err), err, StackStormAPI.stream_backoff)
+            )
+            traceback.print_exc()
+            time.sleep(StackStormAPI.stream_backoff)
+        finally:
+            LOG.info("*** Closing listener async loop ***")
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+
+        LOG.info("*** Exit stream listener thread ***")
